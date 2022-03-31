@@ -1,0 +1,223 @@
+library(tidyverse)
+library(tidyquant)
+library(PMwR)
+
+###
+##### AUX FUNC -----
+###
+
+# {{cointegration_test}}
+# INPUT: numero de periodos
+# OUTPUT: p-value do teste de cointegracao
+cointegration_test <- function(n_periods, close = close){
+  
+  # Recebe fechamentos
+  close <- close[1:n_periods,]
+  
+  # Testa grau de integracao das duas variaveis
+  if(PP.test(na.omit(diff(close[,2])))$p.value > 0.05) return(NA)
+  if(PP.test(close[,2])$p.value <= 0.05) return(NA)
+  
+  if(PP.test(na.omit(diff(close[,2])))$p.value > 0.05) return(NA)
+  if(PP.test(close[,1])$p.value <= 0.05) return(NA)
+  
+  # Calcula regressao
+  x <- as.matrix(data.frame(intercept = 1, 
+                            x = close[,2]))
+  lm <- .lm.fit(x = x,
+                y = unlist(close[,1]))
+  
+  # Retorna pvalue do teste de PP
+  return(PP.test(lm$residuals)$p.value)
+  
+}
+
+# {{best_lm_data}}
+# INPUT: numero de periodos
+# OUTPUT: ultimo residuo, desvio padrao, meia vida, alfa, beta, r2
+best_lm_data <- function(n_periods, close = close){
+  
+  # Recebe fechamentos
+  close <- close[1:n_periods,]
+  
+  # Calcula regressao
+  x <- as.matrix(data.frame(intercept = 1, 
+                            x = close[,2]))
+  lm <- .lm.fit(x = x,
+                y = unlist(close[,1]))
+  
+  last_residual <- first(unname(lm$residuals))
+  residuals_sd <- sd(lm$residuals)
+  r2 <-   sum(lm$residuals^2)/sum((unlist(close[,1]) - mean(unlist(close[,1])))^2)
+  
+  # Calcula meia vida
+  # OU_method_data <- data.frame(diff_error = ,
+  #                                        excess_diff_error = )
+  
+  lambda <- .lm.fit(y = as.matrix(na.omit(lm$residuals - lead(lm$residuals))),
+                    x = as.matrix(lm$residuals[-1] - mean(lm$residuals[-1])))$coefficients[1]
+  
+  half_life <- ifelse(lambda < 0, -log(2)/lambda, NA)
+  
+  return(c(last_residual = last_residual, 
+           residuals_sd = residuals_sd, 
+           half_life = half_life, 
+           alpha = lm$coefficients[1], 
+           beta = lm$coefficients[2],
+           r2 = r2))
+  
+}
+
+###
+##### IMPORT DATA -----
+###
+
+rdata <- read_csv('raw_data/main-data.csv')[,-1]
+
+###
+##### WRANGLING DATA -----
+###
+
+# Procura por na
+rdata %>%
+  summarize(sum(is.na(.)))
+
+# Separa timestamp e precos
+prices <- rdata %>%
+  select(-date) %>%
+  as.matrix()
+
+timestamp <- rdata$date
+
+# Cria combinacoes de pares
+# pairs <- gtools::combinations(n = length(unique(colnames(prices))), 
+#                               r = 2,
+#                               v = unique(colnames(prices)),
+#                               repeats.allowed = F)
+
+pairs <- expand.grid(var1 = colnames(prices),var2 = colnames(prices)) %>% filter(var1 != var2) %>% as.matrix()
+
+###
+##### BACKTESTING ----
+###
+
+trade_function <- function(){
+  
+  best_lm_result <- NULL
+  
+  ## Verifica se o portfolio ja esta posicionado
+  if(round(sum(abs(Portfolio())), 3) == 0){ 
+    
+    # Aplica teste de phillips-perron para varios lookback periods
+    pp.tests <- data.frame(periods = c(seq(100, 240, 20), 250),
+                           pvalue = NA)
+    
+    for(i in 1:nrow(pp.tests)){
+      pp.tests[i,'pvalue'] <- cointegration_test(n_periods = pp.tests[i,'periods'], 
+                                                 close = Close(1:max(pp.tests$periods)))
+    }
+    
+    # Verifica se há pelo menos 3 periodos cointegrados
+    if(sum(na.omit(pp.tests$pvalue) <= 0.10) < 3) return(NULL)
+    
+    # Seleciona periodo com maior cointegracao
+    best_period <- pp.tests$periods[which.min(pp.tests$pvalue)]
+    
+    # Calcula ultimo residuo do periodo e desvio padrao
+    best_lm_result <- best_lm_data(best_period, close = Close(1:max(pp.tests$periods)))
+    
+    # Se o beta do lm selecionado for negativo pular
+    if(best_lm_result['beta'] <= 0) return(NULL)
+    
+    # Se a meia vida for negativa pular
+    if(is.na(best_lm_result['half_life'])) return(NULL)
+    
+    # Verifica se ha distorcao suficiente para trade SELL price1
+    if(best_lm_result['last_residual'] >= 2*best_lm_result['residuals_sd']) {
+      
+      # Salva informacoes necessarias para calcular saida no globals (QUAIS?)
+      Globals$actual_active_trade_data <- list(best_lm_result)
+      Globals$timestamp <- Timestamp(0)
+      Globals$last_residual[Time(0L)] <- best_lm_result['last_residual']
+      Globals$residuals_sd[Time(0L)] <- best_lm_result['residuals_sd']
+      Globals$half_life[Time(0L)] <- best_lm_result['half_life']
+      Globals$alpha[Time(0L)] <- best_lm_result['alpha']
+      Globals$beta[Time(0L)] <- best_lm_result['beta']
+      Globals$r2[Time(0L)] <- best_lm_result['r2']
+      Globals$n_signif[Time(0L)]  <- sum(na.omit(pp.tests$pvalue) <= 0.10)
+      Globals$best_period[Time(0L)] <- best_period
+      
+      # Retorna pesos
+      return(c(-1, best_lm_result['beta'])/sum(abs(c(-1, best_lm_result['beta']))))
+      
+      # Verifica se ha distorcao suficiente para trade BUY price1
+    } else if(best_lm_result['last_residual'] <= -2*best_lm_result['residuals_sd']){
+      
+      # Salva informacoes necessarias para calcular saida no globals (QUAIS?)
+      Globals$actual_active_trade_data <- list(best_lm_result)
+      Globals$timestamp <- Timestamp(0)
+      Globals$last_residual[Time(0L)] <- best_lm_result['last_residual']
+      Globals$residuals_sd[Time(0L)] <- best_lm_result['residuals_sd']
+      Globals$half_life[Time(0L)] <- best_lm_result['half_life']
+      Globals$alpha[Time(0L)] <- best_lm_result['alpha']
+      Globals$beta[Time(0L)] <- best_lm_result['beta']
+      Globals$r2[Time(0L)] <- best_lm_result['r2']
+      Globals$n_signif[Time(0L)]  <- sum(na.omit(pp.tests$pvalue) <= 0.10)
+      Globals$best_period[Time(0L)] <- best_period
+      
+      # Retorna pesos
+      return(c(1, -best_lm_result['beta'])/sum(abs(c(1, -best_lm_result['beta']))))
+      
+    } else return(NULL)
+    
+    
+  } 
+  else{ 
+    
+    # Calcula erro
+    actual_residual <- Close()[1] - (Globals$actual_active_trade_data[[1]]['alpha'] + Globals$actual_active_trade_data[[1]]['beta']*Close()[2])
+    
+    # Saida por meia vida
+    Globals$actual_active_trade_data[[1]]['half_life'] <- Globals$actual_active_trade_data[[1]]['half_life'] - 1
+    if(Globals$actual_active_trade_data[[1]]['half_life'] <= 0) return(c(0,0))
+    
+    # Saida por alvo
+    if(Portfolio()[1] < 0){
+      if(actual_residual <= 0) return(c(0,0)) # Caso esteja long x short y
+    } else{
+      if(actual_residual >= 0) return(c(0, 0)) # Caso esteja long y short x
+    }
+    
+    return(NULL) # Caso nenhum dos dois criterios se satisfaça
+  }
+  
+}
+
+result <- map(.x = 1:nrow(pairs), .f = function(idx){
+  
+  start_ <- Sys.time()
+  
+  sel_pairs <- pairs[idx,]
+  sel_prices <- prices[,sel_pairs]
+  
+  btest_result <- btest(prices = list(sel_prices), 
+                        signal = trade_function, 
+                        tc = 0.005*0.15, 
+                        b = 251,
+                        convert.weights = T,
+                        initial.cash = 1000000,
+                        include.data = T,
+                        include.timestamp = T,
+                        timestamp = timestamp,
+                        instrument = unlist(sel_pairs),
+                        progressBar = T)
+  
+  print(Sys.time() - start_)
+  
+  print(paste0(idx, ' pares concluídos'))
+  
+  return(btest_result)
+})
+
+# Salva resultado
+save(result, file = 'result.rda')
